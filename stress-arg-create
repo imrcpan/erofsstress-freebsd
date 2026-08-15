@@ -1,0 +1,27 @@
+#!/bin/sh -e
+
+TIMEOUT=$1
+SEED=$2
+SHARE=$3
+
+rm -f stress-arg
+echo '#!/bin/sh -e' >> ./stress-arg
+echo "export STRESS_TIMEOUT=$TIMEOUT" >> ./stress-arg
+echo "export STRESS_SEED=$SEED" >> ./stress-arg
+echo "export STRESS_SHARE=$SHARE" >> ./stress-arg
+
+if [ -z $TIMEOUT ]; then
+    echo "ERROR: TIMEOUT must be set"
+    exit 1
+fi
+
+if [ -z $SEED ]; then
+    echo "ERROR: SEED must be set"
+    exit 1
+fi
+
+if [ -z $SHARE ]; then
+    echo "ERROR: SHARE must be set"
+    exit 1
+fi
+

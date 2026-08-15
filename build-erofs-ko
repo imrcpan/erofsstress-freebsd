@@ -1,0 +1,13 @@
+#!/bin/sh -e
+
+pkg install -y git
+git clone $KO_REPO ko_repo
+git clone --branch releng/15.1 --depth 1 https://git.freebsd.org/src.git freebsd-src
+
+SYSDIR=$PWD/freebsd-src/sys
+echo "SYSDIR $SYSDIR"
+
+cd ko_repo
+make -m $SYSDIR/share/mk SYSDIR=$SYSDIR
+cd ..
+cp ko_repo/erofs.ko ./erofs.ko

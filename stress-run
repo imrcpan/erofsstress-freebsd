@@ -1,0 +1,88 @@
+#!/bin/sh -e
+
+chmod +x ./*
+
+set +x
+
+echo "Stressing EROFS in QEMU..."
+
+. ./stress-arg
+
+echo "===== stress-arg ====="
+cat ./stress-arg
+echo "===== end stress-arg ====="
+
+kldload ./erofs.ko
+echo "EROFS KO loaded"
+
+WORKERS=7
+
+TIMEOUT=$STRESS_TIMEOUT
+SEED=$STRESS_SEED
+SHARE=$STRESS_SHARE
+
+if [ -z "$TIMEOUT" ] || [ -z "$SEED" ] || [ -z "$SHARE" ]; then
+    echo "ERROR: STRESS_TIMEOUT, STRESS_SEED and STRESS_SHARE must all be set"
+    exit 1
+fi
+
+mount -t tmpfs tmpfs /mnt
+mkdir -p /mnt/golden /mnt/testA /mnt/testB
+
+sync
+
+sysctl kern.maxfilesperproc=10000000 2>/dev/null || \
+sysctl kern.maxfilesperproc=1000000
+ulimit -n 10000000 2>/dev/null || \
+ulimit -n 1000000
+
+pkg install -y git
+git clone https://github.com/imrcpan/erofsstress-utils.git erofsstress-utils
+cd erofsstress-utils
+make
+cd ..
+cp erofsstress-utils/stress /root/stress
+chmod +x /root/stress
+
+set -e
+
+if [ $SHARE -eq 0 ]; then
+  MD_GOLDEN=$(mdconfig -a -t vnode -f golden.erofs)
+  MD_TESTA=$(mdconfig -a -t vnode -f testA.erofs)
+  mount -t erofs -oro /dev/$MD_GOLDEN /mnt/golden
+  mount -t erofs -oro /dev/$MD_TESTA /mnt/testA
+  timeout --preserve-status -k30 $TIMEOUT \
+  /root/stress -p$WORKERS -s$SEED -l0 -d/mnt/log/baddump /mnt/testA /mnt/golden || [ $? -ne 124 ] && { sync; exit; }
+else
+  MD_GOLDEN=$(mdconfig -a -t vnode -f golden.erofs)
+  MD_TESTA=$(mdconfig -a -t vnode -f testA.erofs)
+  MD_TESTB=$(mdconfig -a -t vnode -f testB.erofs)
+  mount -t erofs -oro,inode_share,domain_id=test /dev/$MD_GOLDEN /mnt/golden
+  mount -t erofs -oro,inode_share,domain_id=test /dev/$MD_TESTA /mnt/testA
+  mount -t erofs -oro,inode_share,domain_id=test /dev/$MD_TESTB /mnt/testB
+  exitA=$(mktemp)
+  timeout --preserve-status -k30 $TIMEOUT \
+  /root/stress -p$WORKERS -s$SEED -l0 -d/mnt/log/baddump /mnt/testA /mnt/golden || echo $? > $exitA &
+  pidA=$!
+  exitB=$(mktemp)
+  timeout --preserve-status -k30 $TIMEOUT \
+  /root/stress -p$WORKERS -s$SEED -l0 -d/mnt/log/baddump /mnt/testB /mnt/golden || echo $? > $exitB &
+  pidB=$!
+  wait $pidA || true
+  wait $pidB || true
+  exit_codeA=$(cat $exitA)
+  exit_codeA=${exit_codeA:-0}
+  exit_codeB=$(cat $exitB)
+  exit_codeB=${exit_codeB:-0}
+  rm -f $exitA
+  rm -f $exitB
+  echo "EXIT code:$exitA, $exitB"
+  if [ "$exit_codeA" -ne 0 -a "$exit_codeA" -ne 124 ] || [ "$exit_codeB" -ne 0 -a "$exit_codeB" -ne 124 ]; then
+    sync
+    exit 1
+  fi
+fi
+
+sync
+exit 0
+
