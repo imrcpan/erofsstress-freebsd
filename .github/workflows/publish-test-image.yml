@@ -1,0 +1,105 @@
+name: publish-test-image
+
+on:
+    schedule:
+        - cron: "0 0 * * 1"
+    workflow_dispatch:
+        inputs:
+            utils_repo:
+                description: "erofs-utils Git Repository"
+                default: "git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git"
+                required: true
+                type: string
+            utils_branch:
+                description: "erofs-utils Git Branch"
+                default: "experimental"
+                required: true
+                type: string
+
+permissions:
+    contents: write
+
+env:
+    LZ4_VER: 1.10.0
+    XZ_VER: 5.6.4
+    UTILS_REPO: ${{ github.event_name == 'schedule' && 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git' || github.event.inputs.utils_repo }}
+    UTILS_BRANCH: ${{ github.event_name == 'schedule' && 'experimental' || github.event.inputs.utils_branch }}
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    build-erofs-utils:
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                suffix: ["", "_mt"]
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Build erofs-utils
+              run: |
+                  sudo apt-get -qq update
+                  sudo apt-get install -y autoconf automake libtool pkg-config libfuse-dev libselinux1-dev libzstd-dev uuid-dev
+                  curl -L https://github.com/lz4/lz4/releases/download/v$LZ4_VER/lz4-$LZ4_VER.tar.gz | tar -zxv
+                  (cd lz4-$LZ4_VER; make BUILD_STATIC=no; sudo make install BUILD_STATIC=no)
+                  curl -L https://github.com/tukaani-project/xz/releases/download/v$XZ_VER/xz-$XZ_VER.tar.gz | tar -zxv
+                  (cd xz-$XZ_VER; ./configure; sudo make install)
+                  rm -rf erofs-utils; mkdir -p erofs-utils
+                  git clone $UTILS_REPO -b $UTILS_BRANCH erofs-utils
+                  cd erofs-utils
+                  MT="dis";[ "x${{ matrix.suffix }}" = "x_mt" ] && MT="en"
+                  mkdir output
+                  ./autogen.sh && ./configure --enable-debug --enable-werror --enable-fuse \
+                      --enable-lz4 --enable-lzma --with-selinux --with-libzstd \
+                      --${MT}able-multithreading \
+                      --prefix=$(pwd)/output && \
+                      make && make install
+                  cp -f contrib/stress output/bin
+            - name: Upload erofs-utils
+              uses: actions/upload-artifact@v7
+              with:
+                  name: erofs-utils${{ matrix.suffix }}
+                  path: |
+                      erofs-utils/output
+
+    gen-golden-image:
+        runs-on: ubuntu-latest
+        needs: build-erofs-utils
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Download erofs-utils prebuilts
+              uses: actions/download-artifact@v8
+              with:
+                  name: erofs-utils
+            - name: Set up golden image
+              run: |
+                  sudo apt-get -qq update
+                  sudo apt-get install -y busybox
+                  chmod +x ./*
+                  chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
+                  ./genimage testdata golden.erofs '--xattr-inode-digest=sha256.erofs.fingerprint -zlz4hc,12 -Ededupe,fragments,ztailpacking -C65536'
+            - name: Check golden.erofs
+              run: |
+                  test -f golden.erofs
+                  ls -lh golden.erofs
+            - name: Delete old latest release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release delete latest --yes || true
+            - name: Delete old latest tag
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  git push origin --delete latest || true
+            - name: Create latest release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release create latest \
+                      --title "Latest" \
+                      --notes "EROFS golden image" \
+                      golden.erofs
