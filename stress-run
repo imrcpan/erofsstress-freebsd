@@ -12,9 +12,6 @@ echo "===== stress-arg ====="
 cat ./stress-arg
 echo "===== end stress-arg ====="
 
-kldload ./erofs.ko
-echo "EROFS KO loaded"
-
 WORKERS=7
 
 TIMEOUT=$STRESS_TIMEOUT

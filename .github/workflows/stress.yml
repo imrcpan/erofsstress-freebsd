@@ -6,9 +6,14 @@ on:
   # Allows to run this workflow manually from the Actions tab
   workflow_dispatch:
     inputs:
-      ko_repo:
-        description: "Out-of-Tree FreeBSD Repository"
-        default: "https://git.xdm.one/imrcpan/erofs-freebsd-out-tree.git"
+      src_repo:
+        description: "Target FreeBSD Repository"
+        default: "https://github.com/imrcpan/erofs-freebsd.git"
+        required: true
+        type: string
+      src_branch:
+        description: "Target FreeBSD Branch"
+        default: "dev"
         required: true
         type: string
       utils_repo:
@@ -31,19 +36,26 @@ on:
         default: ""
         required: false
         type: string
+      skip_world:
+        description: Skip building the world, use the latest prebuilt one
+        type: boolean
+        default: true
       test_share:
         description: "Run share test"
-        default: true
+        default: false
         required: true
         type: boolean
 
 env:
   LZ4_VER: 1.10.0
   XZ_VER: 5.6.4
-  KO_REPO: ${{ github.event_name == 'schedule' && 'https://git.xdm.one/imrcpan/erofs-freebsd-out-tree.git' || github.event.inputs.ko_repo }}
+  SRC_REPO: ${{ github.event_name == 'schedule' && 'https://github.com/imrcpan/erofs-freebsd.git' || github.event.inputs.src_repo }}
+  SRC_BRANCH: ${{ github.event_name == 'schedule' && 'dev' || github.event.inputs.src_branch }}
   UTILS_REPO: ${{ github.event_name == 'schedule' && 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git' || github.event.inputs.utils_repo }}
   UTILS_BRANCH: ${{ github.event_name == 'schedule' && 'experimental' || github.event.inputs.utils_branch }}
   TIMEOUT: ${{ github.event_name == 'schedule' && 14400 || github.event.inputs.timeout }}
+  SKIP_WORLD: ${{ github.event_name == 'schedule' && 'true' || github.event.inputs.skip_world }}
+  BUNDLE: ${{ github.workspace }}/freebsd-built.tar.zst
 
 defaults:
   run:
@@ -81,62 +93,31 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: erofs-utils${{ matrix.suffix }}
-          path: |
-            erofs-utils/output
+          path: erofs-utils/output
+          retention-days: 1
 
-  gen-golden-image:
-    runs-on: ubuntu-latest
-    needs: build-erofs-utils
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Cache golden image
-        id: cache-golden
-        uses: actions/cache@v4
-        with:
-          path: |
-            golden.erofs
-          key: golden-${{ hashFiles('./genimage') }}
-      - name: Download erofs-utils prebuilts
-        if: steps.cache-golden.outputs.cache-hit != 'true'
-        uses: actions/download-artifact@v8
-        with:
-          name: erofs-utils
-      - name: Set up golden image
-        if: steps.cache-golden.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y busybox
-          chmod +x ./*
-          chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
-          ./genimage testdata golden.erofs '--xattr-inode-digest=sha256.erofs.fingerprint -zlz4hc,12 -Ededupe,fragments,ztailpacking -C65536'
-
-  build-erofs-ko:
+  build-freebsd:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Build EROFS
-        uses: vmactions/freebsd-vm@v1
+      - name: Build FreeBSD kernel and world
+        uses: imrcpan/freebsd-kernel-ci-tester@main
         with:
-          release: 15.1
-          envs: KO_REPO
-          cache-after-prepare: true
-          prepare: |
-
-          run: |
-            chmod +x ./*
-            ./build-erofs-ko
-      - name: Upload KO
+          src-repo: ${{ env.SRC_REPO }}
+          src-branch: ${{ env.SRC_BRANCH }}
+          kernconf: GENERIC
+          skip-world: ${{ env.SKIP_WORLD }}
+          export-image: ${{ env.BUNDLE }}
+      - name: Hand the built system to the test jobs
         uses: actions/upload-artifact@v7
         with:
-          name: erofs-ko
-          path: |
-            erofs.ko
+          name: freebsd-built
+          path: ${{ env.BUNDLE }}
+          retention-days: 1
+          compression-level: 0
 
   stress-run:
     runs-on: ubuntu-latest
-    needs: [build-erofs-ko, build-erofs-utils, gen-golden-image]
+    needs: [build-freebsd, build-erofs-utils]
     strategy:
       matrix:
         alg: ["", "-zlz4", "-zlz4hc,12", "-zlzma,9", "-zdeflate", "-zzstd"]
@@ -145,34 +126,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Restore rootfs image
-        id: restore-rootfs
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            rootfs.img
-          key: stressrootfs-${{hashFiles('stress-overlay', 'genrootfs')}}
-      - name: Fetch golden image
-        id: fetch-golden
-        uses: actions/cache@v4
-        with:
-          path: |
-            golden.erofs
-          key: golden-${{ hashFiles('./genimage') }}
       - name: Download erofs-utils prebuilts
         uses: actions/download-artifact@v8
         with:
           name: erofs-utils
-      - name: Download KO
+      - name: Download FreeBSD prebuilts
         uses: actions/download-artifact@v8
         with:
-          name: erofs-ko
+          name: freebsd-built
+          path: ${{ runner.temp }}/built
       - name: Stress prepare
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y fuse
           chmod +x ./*
           chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
+          wget https://github.com/imrcpan/erofsstress-freebsd/releases/download/latest/golden.erofs
           mkdir mnt
           bin/erofsfuse golden.erofs mnt
           if [ "x${{ matrix.set }}" = "x1" ]; then
@@ -198,21 +167,11 @@ jobs:
             ./stress-arg-create $TIMEOUT $seed ${{ matrix.share }}
           fi
       - name: Stress run
-        uses: vmactions/freebsd-vm@v1
+        uses: imrcpan/freebsd-kernel-ci-tester@main
         with:
-          release: 15.1
-          cache-after-prepare: true
-          prepare: |
-
+          image: ${{ runner.temp }}/built/freebsd-built.tar.zst
+          mem: "8192"
+          sync-dir: ${{ github.workspace }}
           run: |
             chmod +x ./*
             ./stress-run
-      - name: Upload images if the test fails
-        uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: qemu-image-dump-${{ matrix.alg }}-${{ matrix.set }}-${{ matrix.share }}
-          path: |
-            *.erofs
-            baddump*
-            !overlay.ext4
